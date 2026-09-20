@@ -6,7 +6,7 @@ if not shared or type(shared.CreateTab) ~= "function" then
 end
 
 local ok, my_own_tab = pcall(function()
-	return shared.CreateTab("Firefly Timer", "/aux0on/AllTheAdd-OnsIcon/refs/heads/main/Untitled163_20260918192358")
+	return shared.CreateTab("Firefly Timer", "/Devon67retro/Test/refs/heads/main/icon")
 end)
 
 if not ok or not my_own_tab then
