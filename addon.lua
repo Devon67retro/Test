@@ -78,7 +78,7 @@ local cdFontSize = 22
 local enabled = false
 local autoJumpEnabled = false
 local firstJumpTiming = 0.24
-local secondJumpTiming = 0.50
+local secondJumpTiming = 0.40
 
 local isCountingDown = false
 local fireflyActive = false
