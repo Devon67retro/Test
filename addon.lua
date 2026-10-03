@@ -23,9 +23,48 @@ if not ok2 or not my_own_section then
 	return
 end
 
-my_own_section:AddLabel("Made by: SANGUINE 🔚🔚 ")
-my_own_section:AddParagraph("Firefly Timer", "Jumps at 0.24s remaining, second jump 0.50s later.")
+pcall(function() my_own_section:AddLabel("Made by: SANGUINE 🤤🤤") end)
+pcall(function() my_own_section:AddParagraph("Firefly Timer", "Jumps at 0.24s remaining, second jump 0.50s later.") end)
 
+-- ===== Toggle first, so it always appears =====
+local enabled = false
+local desired = false
+local ready = false
+local api = {}
+
+local function apply(bool)
+	if api.isCurrent and not api.isCurrent() then return end
+	enabled = bool
+	if bool then
+		local okSetup, errSetup = pcall(function()
+			api.buildGui()
+			api.buildCooldownGui()
+			api.hookTool()
+		end)
+		if not okSetup then
+			warn("[Firefly Timer] enable failed: " .. tostring(errSetup))
+		end
+		pcall(function() shared.Notify("Firefly Timer enabled", 2) end)
+	else
+		local okOff, errOff = pcall(function() api.unhookTool() end)
+		if not okOff then
+			warn("[Firefly Timer] disable failed: " .. tostring(errOff))
+		end
+		pcall(function() shared.Notify("Firefly Timer disabled", 2) end)
+	end
+end
+
+local okToggle, errToggle = pcall(function()
+	return my_own_section:AddToggle("Enable Firefly Timer", function(bool)
+		desired = bool and true or false
+		if ready then apply(desired) end
+	end)
+end)
+if not okToggle then
+	warn("[Firefly Timer] AddToggle failed: " .. tostring(errToggle))
+end
+
+local function init()
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local ContextActionService = game:GetService("ContextActionService")
@@ -104,7 +143,6 @@ local frameSize = UDim2.new(0, 100, 0, 50)
 local framePosition = UDim2.new(0.5, -50, 0.5, -100)
 local cdFontSize = 48
 
-local enabled = false
 local firstJumpTiming = 0.24
 local secondJumpTiming = 0.50
 
@@ -480,29 +518,20 @@ local function hookTool()
 	end)
 end
 
--- Toggle is created LAST so every function it calls already exists
--- (the hub may fire this callback immediately with the saved state).
-my_own_section:AddToggle("Enable Firefly Timer", function(bool)
-	if not isCurrent() then return end
-	enabled = bool
 
-	if bool then
-		local okSetup, errSetup = pcall(function()
-			buildGui()
-			buildCooldownGui()
-			hookTool()
-		end)
-		if not okSetup then
-			warn("[Firefly Timer] enable failed: " .. tostring(errSetup))
-		end
-		shared.Notify("Firefly Timer enabled", 2)
-	else
-		local okOff, errOff = pcall(unhookTool)
-		if not okOff then
-			warn("[Firefly Timer] disable failed: " .. tostring(errOff))
-		end
-		shared.Notify("Firefly Timer disabled", 2)
-	end
-end)
+	api.isCurrent = isCurrent
+	api.buildGui = buildGui
+	api.buildCooldownGui = buildCooldownGui
+	api.hookTool = hookTool
+	api.unhookTool = unhookTool
+end
+
+local okInit, errInit = xpcall(init, function(e) return tostring(e) .. "\n" .. debug.traceback() end)
+if not okInit then
+	warn("[Firefly Timer] init failed: " .. tostring(errInit))
+else
+	ready = true
+	if desired then apply(true) end -- hub restored ON before we were ready
+end
 
 print("[Firefly Timer] Loaded successfully")
