@@ -23,7 +23,7 @@ if not ok2 or not my_own_section then
 	return
 end
 
-my_own_section:AddLabel("Made by: SANGUINE 🤤🤤")
+my_own_section:AddLabel("Made by: SANGUINE 🌺 🌺 ")
 my_own_section:AddParagraph("Firefly Timer", "Open the settings GUI to configure Auto Jump and Firefly Timer.")
 
 local ENV
