@@ -19,16 +19,45 @@ local function note(msg)
 	pcall(function() shared.Notify(msg, 4) end)
 end
 
--- ===== TOGGLE FIRST: nothing above can fail, so it always appears =====
-local impl = { ready = false, desired = false }
+-- ===== TOGGLES FIRST: nothing above can fail, so they always appear =====
+local impl = {
+	ready = false,
+	desired = false,        -- Enable Firefly Timer
+	desiredRestore = false, -- Restore Jar On Respawn
+	desiredMove = false,    -- Move Cooldown Window
+}
+
+local function safeCall(fn, ...)
+	if type(fn) ~= "function" then return end
+	local okA, errA = pcall(fn, ...)
+	if not okA then note("Error: " .. tostring(errA)) end
+end
 
 pcall(function()
 	my_own_section:AddToggle("Enable Firefly Timer", function(bool)
 		impl.desired = bool and true or false
-		if impl.ready then
-			local okA, errA = pcall(impl.apply, impl.desired)
-			if not okA then note("Toggle error: " .. tostring(errA)) end
-		end
+		if impl.ready then safeCall(impl.apply, impl.desired) end
+	end)
+end)
+
+pcall(function()
+	my_own_section:AddToggle("Restore Jar On Respawn", function(bool)
+		impl.desiredRestore = bool and true or false
+		if impl.ready then safeCall(impl.setRestore, impl.desiredRestore) end
+	end)
+end)
+
+pcall(function()
+	my_own_section:AddToggle("Move Cooldown Window", function(bool)
+		impl.desiredMove = bool and true or false
+		if impl.ready then safeCall(impl.setMove, impl.desiredMove) end
+	end)
+end)
+
+pcall(function()
+	-- Saves only on a user flip after load (never from the hub restoring state on join)
+	my_own_section:AddToggle("Save Cooldown Position", function(bool)
+		if bool and impl.ready then safeCall(impl.savePos) end
 	end)
 end)
 
@@ -38,6 +67,8 @@ pcall(function() my_own_section:AddLabel("Made by: SANGUINE 🤤🤤") end)
 local function init()
 	local Players = game:GetService("Players")
 	local RunService = game:GetService("RunService")
+	local UserInputService = game:GetService("UserInputService")
+	local HttpService = game:GetService("HttpService")
 	local LocalPlayer = Players.LocalPlayer
 	local stepEvent = RunService.PreSimulation or RunService.Stepped
 	local pg = LocalPlayer:WaitForChild("PlayerGui")
@@ -45,8 +76,11 @@ local function init()
 	local COUNTDOWN = 2.5
 	local COOLDOWN = 16
 	local JUMP_OFFSET = 0       -- nudge first jump in seconds: negative = earlier, positive = later
-	local JUMP1_AT = COUNTDOWN + JUMP_OFFSET -- first jump when the countdown hits 0
-	local JUMP_GAP = 0.50   -- second jump this long after the first ACTUALLY fires
+	local JUMP1_AT = COUNTDOWN + JUMP_OFFSET
+	local JUMP_GAP = 0.50
+
+	local RESTORE_DELAY = 1.5   -- seconds to let the game hand out its own jar before we restore ours
+	local POS_FILE = "FireflyTimer_CDPos.json"
 
 	local MY_ID = tostring(os.clock()) .. tostring(math.random(1000, 9999))
 	pcall(function() LocalPlayer:SetAttribute("FireflyRunId", MY_ID) end)
@@ -57,12 +91,27 @@ local function init()
 	end
 
 	local enabled = false
-	local token, deadline = 0, 0
+	local moveMode = false
+	local token = 0
 	local countEnd, cdStart, cdEnd = 0, 0, 0
 	local conns, hooked = {}, {}
 	local scanToken = 0
 	local gui, countLabel, cdLabel
-	local firstActivate = true
+
+	-- ===== Saved cooldown-window position =====
+	local savedPos = nil -- UDim2 (scale), loaded from file
+
+	local function loadPos()
+		pcall(function()
+			if isfile and readfile and isfile(POS_FILE) then
+				local d = HttpService:JSONDecode(readfile(POS_FILE))
+				if type(d) == "table" and type(d.x) == "number" and type(d.y) == "number" then
+					savedPos = UDim2.fromScale(math.clamp(d.x, 0, 0.95), math.clamp(d.y, 0, 0.95))
+				end
+			end
+		end)
+	end
+	loadPos()
 
 	-- remove old guis (PlayerGui only, every step guarded)
 	for _, n in ipairs({ "FireflyLiteGui", "FireflyTimerGui", "FireflyCooldownGui", "FireflySettingsGui" }) do
@@ -88,6 +137,28 @@ local function init()
 		return l
 	end
 
+	local function setupDrag(label)
+		local dragging, dragStart, startPos = false, nil, nil
+		label.InputBegan:Connect(function(input)
+			if not moveMode or not isCurrent() then return end
+			if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+				dragging = true
+				dragStart = input.Position
+				startPos = label.Position
+				input.Changed:Connect(function()
+					if input.UserInputState == Enum.UserInputState.End then dragging = false end
+				end)
+			end
+		end)
+		UserInputService.InputChanged:Connect(function(input)
+			if not dragging or not moveMode or not isCurrent() then return end
+			if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseMovement then
+				local d = input.Position - dragStart
+				label.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+			end
+		end)
+	end
+
 	local function buildGui()
 		if gui and gui.Parent then return end
 		gui = Instance.new("ScreenGui")
@@ -97,28 +168,37 @@ local function init()
 		gui.DisplayOrder = 999
 		gui.Parent = pg
 		countLabel = makeLabel(gui, UDim2.new(0.5, -50, 0.4, 0), UDim2.fromOffset(100, 50), 32)
-		cdLabel = makeLabel(gui, UDim2.new(0, 20, 0.5, 0), UDim2.fromOffset(110, 44), 26)
+		cdLabel = makeLabel(gui, savedPos or UDim2.new(0, 20, 0.5, 0), UDim2.fromOffset(110, 44), 26)
+		cdLabel.Active = false
+		setupDrag(cdLabel)
+	end
+
+	local function showCdPreview()
+		if not cdLabel then return end
+		cdLabel.Visible = true
+		cdLabel.Text = "CD 0.0"
 	end
 
 	local function hideGui()
 		if countLabel then countLabel.Visible = false end
-		if cdLabel then cdLabel.Visible = false end
+		if cdLabel then
+			if moveMode then showCdPreview() else cdLabel.Visible = false end
+		end
 	end
 
-	-- fires in the air or on the ground (game needs both Jump and ChangeState)
+	-- ===== Jump =====
 	local function fireJump()
 		local char = LocalPlayer.Character
 		local hum = char and char:FindFirstChildOfClass("Humanoid")
 		if not hum or hum.Health <= 0 then return end
 		hum.Jump = true
 		hum:ChangeState(Enum.HumanoidStateType.Jumping)
-		-- release Jump so the character doesn't jump again on landing
 		task.delay(0.1, function()
 			pcall(function() if hum.Parent then hum.Jump = false end end)
 		end)
 	end
 
-	-- use-cooldown lock on the tool itself
+	-- ===== Jar use-cooldown lock =====
 	local lockedTools = {}
 	local function lockTool(tool)
 		lockedTools[tool] = true
@@ -131,14 +211,11 @@ local function init()
 		table.clear(lockedTools)
 	end
 
+	-- ===== Timer =====
 	local function onActivated(tool)
 		if not enabled or not isCurrent() then return end
 		local now = os.clock()
 		if now < cdEnd then return end
-		if firstActivate then
-			firstActivate = false
-			note("Fireflies activated - timer started")
-		end
 
 		token = token + 1
 		local my = token
@@ -151,7 +228,6 @@ local function init()
 		local actStart = now
 		local j1, j2 = false, false
 		local j1Time = 0
-		local timingNoted = false
 		task.spawn(function()
 			while enabled and isCurrent() and my == token do
 				local t = os.clock()
@@ -164,14 +240,10 @@ local function init()
 				if j1 and not j2 and t >= j1Time + JUMP_GAP then
 					j2 = true
 					fireJump()
-					if not timingNoted then
-						timingNoted = true
-						note(string.format("Jump1 at %.3fs, jump2 +%.3fs after", j1Time - actStart, t - j1Time))
-					end
 				end
 
 				local c, k = countEnd - t, cdEnd - t
-				if k > 0 then -- keep the tool locked even if the game re-enables it
+				if k > 0 then
 					for tl in pairs(lockedTools) do
 						pcall(function() if tl.Enabled then tl.Enabled = false end end)
 					end
@@ -181,8 +253,12 @@ local function init()
 					if c > 0 then countLabel.Text = string.format("%.1f", c) end
 				end
 				if cdLabel then
-					cdLabel.Visible = k > 0
-					if k > 0 then cdLabel.Text = string.format("CD %.1f", t - cdStart) end
+					cdLabel.Visible = k > 0 or moveMode
+					if k > 0 then
+						cdLabel.Text = string.format("CD %.1f", t - cdStart)
+					elseif moveMode then
+						cdLabel.Text = "CD 0.0"
+					end
 				end
 				if c <= 0 and k <= 0 then break end
 				stepEvent:Wait()
@@ -200,7 +276,6 @@ local function init()
 					if child:IsA("Tool") and child.Name == "Fireflies" and not hooked[child] then
 						hooked[child] = true
 						table.insert(conns, child.Activated:Connect(function() onActivated(child) end))
-						note("Fireflies hooked")
 					end
 				end
 			end
@@ -209,7 +284,7 @@ local function init()
 
 	local function reset()
 		token = token + 1
-		deadline, countEnd, cdEnd = 0, 0, 0
+		countEnd, cdEnd = 0, 0
 		hideGui()
 		unlockAll()
 	end
@@ -242,12 +317,119 @@ local function init()
 		enabled = bool
 		if enabled then
 			local okS, errS = pcall(start)
-			if okS then note("Firefly Timer ON - equip Fireflies and use it")
+			if okS then note("Firefly Timer enabled")
 			else note("Start error: " .. tostring(errS)) end
 		else
 			pcall(stop)
-			note("Firefly Timer OFF")
+			note("Firefly Timer disabled")
 		end
+	end
+
+	-- ===== Movable cooldown window =====
+	impl.setMove = function(bool)
+		if not isCurrent() then return end
+		moveMode = bool
+		buildGui()
+		cdLabel.Active = bool
+		if bool then
+			showCdPreview()
+		elseif os.clock() >= cdEnd then
+			cdLabel.Visible = false
+		end
+	end
+
+	impl.savePos = function()
+		if not isCurrent() then return end
+		buildGui()
+		local size = gui.AbsoluteSize
+		if size.X <= 0 or size.Y <= 0 then return end
+		local x = math.clamp(cdLabel.AbsolutePosition.X / size.X, 0, 0.95)
+		local y = math.clamp(cdLabel.AbsolutePosition.Y / size.Y, 0, 0.95)
+		savedPos = UDim2.fromScale(x, y)
+		cdLabel.Position = savedPos
+		local wrote = false
+		pcall(function()
+			if writefile then
+				writefile(POS_FILE, HttpService:JSONEncode({ x = x, y = y }))
+				wrote = true
+			end
+		end)
+		if wrote then
+			note("Cooldown position saved")
+		else
+			note("Position kept for this session (executor can't save files)")
+		end
+	end
+
+	-- ===== Restore jar on respawn (client-side only) =====
+	local restoreOn = false
+	local restoreToken = 0
+	local jarCache, cachedFrom = nil, nil
+	local restoreConn = nil
+
+	local function eachJar(fn)
+		local places = { LocalPlayer:FindFirstChildOfClass("Backpack"), LocalPlayer.Character }
+		for i = 1, 2 do
+			local place = places[i]
+			if place then
+				for _, child in ipairs(place:GetChildren()) do
+					if child:IsA("Tool") and child.Name == "Fireflies" then fn(child) end
+				end
+			end
+		end
+	end
+
+	local function restoreJar()
+		if not restoreOn or not isCurrent() then return end
+		local hasJar = false
+		eachJar(function() hasJar = true end)
+		if hasJar or not jarCache then return end -- game already gave one, or nothing cached
+		local bp = LocalPlayer:FindFirstChildOfClass("Backpack") or LocalPlayer:WaitForChild("Backpack", 5)
+		if not bp then return end
+		local okC, c = pcall(function() return jarCache:Clone() end)
+		if okC and c then
+			pcall(function() c.Enabled = true end)
+			pcall(function() c:SetAttribute("FireflyRestored", true) end)
+			c.Parent = bp
+		end
+	end
+
+	impl.setRestore = function(bool)
+		if not isCurrent() then return end
+		restoreOn = bool
+		restoreToken = restoreToken + 1
+		local my = restoreToken
+		if restoreConn then restoreConn:Disconnect() restoreConn = nil end
+		if not bool then return end
+
+		restoreConn = LocalPlayer.CharacterAdded:Connect(function()
+			task.spawn(function()
+				task.wait(RESTORE_DELAY)
+				if restoreToken == my then pcall(restoreJar) end
+			end)
+		end)
+
+		-- keep a spare copy of the real jar while it exists
+		task.spawn(function()
+			while restoreOn and isCurrent() and restoreToken == my do
+				local real, restored = nil, {}
+				eachJar(function(t)
+					if t:GetAttribute("FireflyRestored") then table.insert(restored, t)
+					else real = real or t end
+				end)
+				if real then
+					if real ~= cachedFrom then
+						local okC, c = pcall(function() return real:Clone() end)
+						if okC and c then
+							pcall(function() c.Enabled = true end)
+							jarCache, cachedFrom = c, real
+						end
+					end
+					for _, r in ipairs(restored) do pcall(function() r:Destroy() end) end -- game gave a real one
+				end
+				task.wait(0.5)
+			end
+		end)
 	end
 end
 
@@ -257,5 +439,7 @@ if not okInit then
 	warn("[Firefly Timer] init failed: " .. tostring(errInit))
 else
 	impl.ready = true
-	if impl.desired then pcall(impl.apply, true) end -- hub restored ON early
+	if impl.desired then safeCall(impl.apply, true) end
+	if impl.desiredRestore then safeCall(impl.setRestore, true) end
+	if impl.desiredMove then safeCall(impl.setMove, true) end
 end
