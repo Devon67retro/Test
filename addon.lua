@@ -23,7 +23,7 @@ if not ok2 or not my_own_section then
 	return
 end
 
-my_own_section:AddLabel("Made by: SANGUINE 🤤🤤")
+my_own_section:AddLabel("Made by: SANGUINE 🔚🔚 ")
 my_own_section:AddParagraph("Firefly Timer", "Jumps at 0.24s remaining, second jump 0.50s later.")
 
 local Players = game:GetService("Players")
@@ -32,32 +32,13 @@ local ContextActionService = game:GetService("ContextActionService")
 local LocalPlayer = Players.LocalPlayer
 local pg = LocalPlayer:WaitForChild("PlayerGui")
 
-local enabled = false
-
-local fireflyToggle = my_own_section:AddToggle("Enable Firefly Timer", function(bool)
-	enabled = bool
-
-	if bool then
-		task.spawn(function()
-			local okSetup, errSetup = pcall(function()
-				buildGui()
-				buildCooldownGui()
-				hookTool()
-			end)
-			if not okSetup then
-				warn("[Firefly Timer] enable failed: " .. tostring(errSetup))
-			end
-		end)
-		shared.Notify("Firefly Timer enabled", 2)
-	else
-		task.spawn(function()
-			pcall(function()
-				unhookTool()
-			end)
-		end)
-		shared.Notify("Firefly Timer disabled", 2)
-	end
-end)
+-- Descriptor aliases (read executor globals directly; rawget on getfenv() misses them)
+local sharedStorageAccessor = getgenv
+local functionInterceptor   = hookfunction
+local rulesReader           = getrawmetatable
+local activeMethodReader    = getnamecallmethod
+local writeLockToggler      = setreadonly
+local nativeWrapper         = newcclosure
 
 local function nukeOldGuis()
 	local containers = { pg }
@@ -81,8 +62,8 @@ end
 nukeOldGuis()
 
 local ENV
-if getgenv then
-	local okE, t = pcall(getgenv)
+if sharedStorageAccessor then
+	local okE, t = pcall(sharedStorageAccessor)
 	ENV = okE and t or _G
 else
 	ENV = _G
@@ -107,10 +88,7 @@ end)
 
 local MY_ID = tick() .. math.random(1000, 9999)
 ENV.__FireflyInstanceID = MY_ID
-
-pcall(function()
-	LocalPlayer:SetAttribute("FireflyRunId", MY_ID)
-end)
+pcall(function() LocalPlayer:SetAttribute("FireflyRunId", MY_ID) end)
 
 local function isCurrent()
 	return LocalPlayer:GetAttribute("FireflyRunId") == MY_ID
@@ -126,6 +104,7 @@ local frameSize = UDim2.new(0, 100, 0, 50)
 local framePosition = UDim2.new(0.5, -50, 0.5, -100)
 local cdFontSize = 48
 
+local enabled = false
 local firstJumpTiming = 0.24
 local secondJumpTiming = 0.50
 
@@ -149,7 +128,7 @@ local jumpDeadline = 0
 local backpackAddedConn, charAddedConn
 local backpackWatchConn, characterWatchConn
 
-function buildGui()
+local function buildGui()
 	if screenGui then return end
 	screenGui = Instance.new("ScreenGui")
 	screenGui.Name = "FireflyTimerGui"
@@ -186,7 +165,7 @@ function buildGui()
 	corner.Parent = frame
 end
 
-function buildCooldownGui()
+local function buildCooldownGui()
 	if cdScreenGui then return end
 	cdScreenGui = Instance.new("ScreenGui")
 	cdScreenGui.Name = "FireflyCooldownGui"
@@ -284,7 +263,8 @@ local function fireTwoJumps()
 		pcall(function() task.cancel(ENV.__FireflyJumpThread) end)
 		ENV.__FireflyJumpThread = nil
 	end
-	ENV.__FireflyJumpThread = task.delay(secondJumpTiming, function()
+	local scheduleAfterDelay = task.delay
+	ENV.__FireflyJumpThread = scheduleAfterDelay(secondJumpTiming, function()
 		if not isCurrent() then return end
 		fireJump(myToken)
 		ENV.__FireflyJumpThread = nil
@@ -409,10 +389,10 @@ local function hookRoundRewards()
 	local remote = gameplay and gameplay:FindFirstChild("GetLastRoundRewards")
 	if not remote then return end
 
-	if hookfunction then
+	if functionInterceptor then
 		local ok = pcall(function()
 			local original
-			original = hookfunction(remote.InvokeServer, function(self, ...)
+			original = functionInterceptor(remote.InvokeServer, function(self, ...)
 				if self == remote and isCurrent() and enabled then
 					pcall(resetCooldown)
 				end
@@ -425,18 +405,18 @@ local function hookRoundRewards()
 		end
 	end
 
-	if getrawmetatable and getnamecallmethod and setreadonly and newcclosure then
+	if rulesReader and activeMethodReader and writeLockToggler and nativeWrapper then
 		local ok = pcall(function()
-			local rules = getrawmetatable(game)
+			local rules = rulesReader(game)
 			local originalCall = rules.__namecall
-			setreadonly(rules, false)
-			rules.__namecall = newcclosure(function(self, ...)
-				if self == remote and getnamecallmethod() == "InvokeServer" and isCurrent() and enabled then
+			writeLockToggler(rules, false)
+			rules.__namecall = nativeWrapper(function(self, ...)
+				if self == remote and activeMethodReader() == "InvokeServer" and isCurrent() and enabled then
 					pcall(resetCooldown)
 				end
 				return originalCall(self, ...)
 			end)
-			setreadonly(rules, true)
+			writeLockToggler(rules, true)
 		end)
 		if ok then
 			roundRewardsHooked = true
@@ -499,5 +479,30 @@ local function hookTool()
 		end
 	end)
 end
+
+-- Toggle is created LAST so every function it calls already exists
+-- (the hub may fire this callback immediately with the saved state).
+my_own_section:AddToggle("Enable Firefly Timer", function(bool)
+	if not isCurrent() then return end
+	enabled = bool
+
+	if bool then
+		local okSetup, errSetup = pcall(function()
+			buildGui()
+			buildCooldownGui()
+			hookTool()
+		end)
+		if not okSetup then
+			warn("[Firefly Timer] enable failed: " .. tostring(errSetup))
+		end
+		shared.Notify("Firefly Timer enabled", 2)
+	else
+		local okOff, errOff = pcall(unhookTool)
+		if not okOff then
+			warn("[Firefly Timer] disable failed: " .. tostring(errOff))
+		end
+		shared.Notify("Firefly Timer disabled", 2)
+	end
+end)
 
 print("[Firefly Timer] Loaded successfully")
