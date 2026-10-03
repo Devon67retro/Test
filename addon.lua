@@ -54,8 +54,12 @@ end
 nukeOldGuis()
 
 local ENV
-if getgenv then ENV = getgenv() else ENV = _G end
-
+if getgenv then
+	local okE, t = pcall(getgenv)
+	ENV = okE and t or _G
+else
+	ENV = _G
+end
 if type(ENV) ~= "table" then ENV = _G end
 
 if ENV.__FireflyConnections then
@@ -378,12 +382,12 @@ local function hookRoundRewards()
 
 	if hookfunction then
 		local ok = pcall(function()
-			local old
-			old = hookfunction(remote.InvokeServer, function(self, ...)
+			local original
+			original = hookfunction(remote.InvokeServer, function(self, ...)
 				if self == remote and isCurrent() and enabled then
 					pcall(resetCooldown)
 				end
-				return old(self, ...)
+				return original(self, ...)
 			end)
 		end)
 		if ok then
@@ -392,18 +396,18 @@ local function hookRoundRewards()
 		end
 	end
 
-	if hookmetamethod and getrawmetatable and getnamecallmethod and setreadonly and newcclosure then
+	if getrawmetatable and getnamecallmethod and setreadonly and newcclosure then
 		local ok = pcall(function()
-			local mt = getrawmetatable(game)
-			local oldNamecall = mt.__namecall
-			setreadonly(mt, false)
-			mt.__namecall = newcclosure(function(self, ...)
+			local rules = getrawmetatable(game)
+			local originalCall = rules.__namecall
+			setreadonly(rules, false)
+			rules.__namecall = newcclosure(function(self, ...)
 				if self == remote and getnamecallmethod() == "InvokeServer" and isCurrent() and enabled then
 					pcall(resetCooldown)
 				end
-				return oldNamecall(self, ...)
+				return originalCall(self, ...)
 			end)
-			setreadonly(mt, true)
+			setreadonly(rules, true)
 		end)
 		if ok then
 			roundRewardsHooked = true
