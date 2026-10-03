@@ -32,7 +32,7 @@ pcall(function()
 	end)
 end)
 
-pcall(function() my_own_section:AddLabel("Made by: SANGUINE 🤤🤤") end)
+pcall(function() my_own_section:AddLabel("Made by: SANGUINE 🙏🙏 ") end)
 pcall(function() my_own_section:AddParagraph("Firefly Timer", "Jumps at 0.24s remaining, second jump 0.50s later.") end)
 
 -- ===== Everything else, guarded; errors are shown on screen =====
@@ -45,8 +45,8 @@ local function init()
 	local COUNTDOWN = 2.5
 	local COOLDOWN = 16
 	local JUMP1_AT = COUNTDOWN - 0.24
-	local JUMP2_AT = JUMP1_AT + 0.50
-	local WINDOW = JUMP2_AT + 0.25
+	local JUMP_GAP = 0.50   -- second jump this long after the first ACTUALLY fires
+	local GRACE = 0.35      -- how long to keep waiting to be grounded before giving up
 
 	local MY_ID = tostring(os.clock()) .. tostring(math.random(1000, 9999))
 	pcall(function() LocalPlayer:SetAttribute("FireflyRunId", MY_ID) end)
@@ -105,14 +105,15 @@ local function init()
 		if cdLabel then cdLabel.Visible = false end
 	end
 
-	local function doJump(myToken)
-		if not enabled or not isCurrent() then return end
-		if myToken ~= token or os.clock() > deadline then return end
+	-- returns true = jumped, false = still airborne (retry), nil = no living character
+	local function tryJump()
 		local char = LocalPlayer.Character
 		local hum = char and char:FindFirstChildOfClass("Humanoid")
-		if not hum or hum.Health <= 0 then return end
+		if not hum or hum.Health <= 0 then return nil end
+		if hum.FloorMaterial == Enum.Material.Air then return false end
 		hum.Jump = true
 		hum:ChangeState(Enum.HumanoidStateType.Jumping)
+		return true
 	end
 
 	local function onActivated()
@@ -127,17 +128,31 @@ local function init()
 		token = token + 1
 		local my = token
 		countEnd, cdStart, cdEnd = now + COUNTDOWN, now, now + COOLDOWN
-		deadline = now + WINDOW
 
 		local okG, errG = pcall(buildGui)
 		if not okG then note("GUI error: " .. tostring(errG)) end
 
-		task.delay(JUMP1_AT, doJump, my)
-		task.delay(JUMP2_AT, doJump, my)
-
+		local actStart = now
+		local phase, phaseT = 0, 0
+		-- 0 wait for jump1 time | 1 trying jump1 | 2 wait gap | 3 trying jump2 | 4 done
 		task.spawn(function()
 			while enabled and isCurrent() and my == token do
 				local t = os.clock()
+
+				if phase == 0 and t >= actStart + JUMP1_AT then
+					phase, phaseT = 1, t
+				end
+				if phase == 1 then
+					local r = tryJump()
+					if r then phase, phaseT = 2, t
+					elseif r == nil or t > phaseT + GRACE then phase = 4 end
+				elseif phase == 2 then
+					if t >= phaseT + JUMP_GAP then phase, phaseT = 3, t end
+				elseif phase == 3 then
+					local r = tryJump()
+					if r or r == nil or t > phaseT + GRACE then phase = 4 end
+				end
+
 				local c, k = countEnd - t, cdEnd - t
 				if countLabel then
 					countLabel.Visible = c > 0
