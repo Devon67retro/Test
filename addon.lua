@@ -23,7 +23,7 @@ if not ok2 or not my_own_section then
 	return
 end
 
-my_own_section:AddLabel("Made by: SANGUINE 🦊🦊")
+my_own_section:AddLabel("Made by: SANGUINE 🤤🤤")
 my_own_section:AddParagraph("Firefly Timer", "Jumps at 0.24s remaining, second jump 0.50s later.")
 
 local Players = game:GetService("Players")
@@ -31,6 +31,33 @@ local RunService = game:GetService("RunService")
 local ContextActionService = game:GetService("ContextActionService")
 local LocalPlayer = Players.LocalPlayer
 local pg = LocalPlayer:WaitForChild("PlayerGui")
+
+local enabled = false
+
+local fireflyToggle = my_own_section:AddToggle("Enable Firefly Timer", function(bool)
+	enabled = bool
+
+	if bool then
+		task.spawn(function()
+			local okSetup, errSetup = pcall(function()
+				buildGui()
+				buildCooldownGui()
+				hookTool()
+			end)
+			if not okSetup then
+				warn("[Firefly Timer] enable failed: " .. tostring(errSetup))
+			end
+		end)
+		shared.Notify("Firefly Timer enabled", 2)
+	else
+		task.spawn(function()
+			pcall(function()
+				unhookTool()
+			end)
+		end)
+		shared.Notify("Firefly Timer disabled", 2)
+	end
+end)
 
 local function nukeOldGuis()
 	local containers = { pg }
@@ -80,7 +107,10 @@ end)
 
 local MY_ID = tick() .. math.random(1000, 9999)
 ENV.__FireflyInstanceID = MY_ID
-LocalPlayer:SetAttribute("FireflyRunId", MY_ID)
+
+pcall(function()
+	LocalPlayer:SetAttribute("FireflyRunId", MY_ID)
+end)
 
 local function isCurrent()
 	return LocalPlayer:GetAttribute("FireflyRunId") == MY_ID
@@ -96,7 +126,6 @@ local frameSize = UDim2.new(0, 100, 0, 50)
 local framePosition = UDim2.new(0.5, -50, 0.5, -100)
 local cdFontSize = 48
 
-local enabled = false
 local firstJumpTiming = 0.24
 local secondJumpTiming = 0.50
 
@@ -120,7 +149,7 @@ local jumpDeadline = 0
 local backpackAddedConn, charAddedConn
 local backpackWatchConn, characterWatchConn
 
-local function buildGui()
+function buildGui()
 	if screenGui then return end
 	screenGui = Instance.new("ScreenGui")
 	screenGui.Name = "FireflyTimerGui"
@@ -157,7 +186,7 @@ local function buildGui()
 	corner.Parent = frame
 end
 
-local function buildCooldownGui()
+function buildCooldownGui()
 	if cdScreenGui then return end
 	cdScreenGui = Instance.new("ScreenGui")
 	cdScreenGui.Name = "FireflyCooldownGui"
@@ -470,20 +499,5 @@ local function hookTool()
 		end
 	end)
 end
-
-my_own_section:AddToggle("Enable Firefly Timer", function(bool)
-	if not isCurrent() then return end
-	enabled = bool
-
-	if bool then
-		buildGui()
-		buildCooldownGui()
-		hookTool()
-		shared.Notify("Firefly Timer enabled", 2)
-	else
-		unhookTool()
-		shared.Notify("Firefly Timer disabled", 2)
-	end
-end)
 
 print("[Firefly Timer] Loaded successfully")
