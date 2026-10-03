@@ -1,4 +1,4 @@
-local shared = odh_shared_plugins1
+local shared = odh_shared_plugins
 
 if not shared or type(shared.CreateTab) ~= "function" then
 	warn("[Firefly Timer] Load through the current Overdrive H plugin menu.")
@@ -23,7 +23,7 @@ if not ok2 or not my_own_section then
 	return
 end
 
-my_own_section:AddLabel("Made by: SANGUINE 🤤🤤")
+my_own_section:AddLabel("Made by: SANGUINE ✨✨")
 my_own_section:AddParagraph("Firefly Timer", "Jumps at 0.24s remaining, second jump 0.50s later.")
 
 local ENV
