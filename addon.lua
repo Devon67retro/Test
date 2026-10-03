@@ -33,7 +33,7 @@ pcall(function()
 end)
 
 pcall(function() my_own_section:AddLabel("Made by: SANGUINE 🤤🤤") end)
-pcall(function() my_own_section:AddParagraph("Firefly Timer", "Jumps at 0.24s remaining, second jump 0.50s later.") end)
+pcall(function() my_own_section:AddParagraph("Firefly Timer", "First jump at 2.5s (countdown end), second jump 0.50s later.") end)
 
 -- ===== Everything else, guarded; errors are shown on screen =====
 local function init()
@@ -44,9 +44,8 @@ local function init()
 
 	local COUNTDOWN = 2.5
 	local COOLDOWN = 16
-	local JUMP1_AT = COUNTDOWN - 0.24
+	local JUMP1_AT = COUNTDOWN  -- first jump fires exactly when the countdown hits 0
 	local JUMP_GAP = 0.50   -- second jump this long after the first ACTUALLY fires
-	local GRACE = 0.35      -- how long to keep waiting to be grounded before giving up
 
 	local MY_ID = tostring(os.clock()) .. tostring(math.random(1000, 9999))
 	pcall(function() LocalPlayer:SetAttribute("FireflyRunId", MY_ID) end)
@@ -146,15 +145,17 @@ local function init()
 		lockTool(tool)
 		local actStart = now
 		local j1, j2 = false, false
+		local j1Time = 0
 		task.spawn(function()
 			while enabled and isCurrent() and my == token do
 				local t = os.clock()
 
 				if not j1 and t >= actStart + JUMP1_AT then
 					j1 = true
+					j1Time = t
 					fireJump()
 				end
-				if j1 and not j2 and t >= actStart + JUMP1_AT + JUMP_GAP then
+				if j1 and not j2 and t >= j1Time + JUMP_GAP then
 					j2 = true
 					fireJump()
 				end
