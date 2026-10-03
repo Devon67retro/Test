@@ -33,18 +33,19 @@ pcall(function()
 end)
 
 pcall(function() my_own_section:AddLabel("Made by: SANGUINE 🤤🤤") end)
-pcall(function() my_own_section:AddParagraph("Firefly Timer", "First jump at 2.5s (countdown end), second jump 0.50s later.") end)
 
 -- ===== Everything else, guarded; errors are shown on screen =====
 local function init()
 	local Players = game:GetService("Players")
 	local RunService = game:GetService("RunService")
 	local LocalPlayer = Players.LocalPlayer
+	local stepEvent = RunService.PreSimulation or RunService.Stepped
 	local pg = LocalPlayer:WaitForChild("PlayerGui")
 
 	local COUNTDOWN = 2.5
 	local COOLDOWN = 16
-	local JUMP1_AT = COUNTDOWN  -- first jump fires exactly when the countdown hits 0
+	local JUMP_OFFSET = 0       -- nudge first jump in seconds: negative = earlier, positive = later
+	local JUMP1_AT = COUNTDOWN + JUMP_OFFSET -- first jump when the countdown hits 0
 	local JUMP_GAP = 0.50   -- second jump this long after the first ACTUALLY fires
 
 	local MY_ID = tostring(os.clock()) .. tostring(math.random(1000, 9999))
@@ -111,6 +112,10 @@ local function init()
 		if not hum or hum.Health <= 0 then return end
 		hum.Jump = true
 		hum:ChangeState(Enum.HumanoidStateType.Jumping)
+		-- release Jump so the character doesn't jump again on landing
+		task.delay(0.1, function()
+			pcall(function() if hum.Parent then hum.Jump = false end end)
+		end)
 	end
 
 	-- use-cooldown lock on the tool itself
@@ -146,6 +151,7 @@ local function init()
 		local actStart = now
 		local j1, j2 = false, false
 		local j1Time = 0
+		local timingNoted = false
 		task.spawn(function()
 			while enabled and isCurrent() and my == token do
 				local t = os.clock()
@@ -158,6 +164,10 @@ local function init()
 				if j1 and not j2 and t >= j1Time + JUMP_GAP then
 					j2 = true
 					fireJump()
+					if not timingNoted then
+						timingNoted = true
+						note(string.format("Jump1 at %.3fs, jump2 +%.3fs after", j1Time - actStart, t - j1Time))
+					end
 				end
 
 				local c, k = countEnd - t, cdEnd - t
@@ -175,7 +185,7 @@ local function init()
 					if k > 0 then cdLabel.Text = string.format("CD %.1f", t - cdStart) end
 				end
 				if c <= 0 and k <= 0 then break end
-				RunService.Heartbeat:Wait()
+				stepEvent:Wait()
 			end
 			if my == token then hideGui() unlockAll() end
 		end)
