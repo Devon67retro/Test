@@ -6,678 +6,466 @@ if not shared or type(shared.CreateTab) ~= "function" then
 end
 
 local ok, my_own_tab = pcall(function()
-	return shared.CreateTab("Firefly Timer", "/Devon67retro/Test/refs/heads/main/icon")
+	return shared.CreateTab("Firefly Timer", "/Devon67retro/Debug/refs/heads/main/icon")
 end)
-
-if not ok or not my_own_tab then
-	warn("[Firefly Timer] CreateTab failed: " .. tostring(my_own_tab))
-	return
-end
+if not ok or not my_own_tab then return end
 
 local ok2, my_own_section = pcall(function()
-	return my_own_tab:AddSection("Firefly Timer", "Auto Jump + cooldown tracker")
+	return my_own_tab:AddSection("Firefly Timer", "Countdown + auto jump")
 end)
+if not ok2 or not my_own_section then return end
 
-if not ok2 or not my_own_section then
-	warn("[Firefly Timer] AddSection failed: " .. tostring(my_own_section))
-	return
+local function note(msg)
+	pcall(function() shared.Notify(msg, 4) end)
 end
 
-my_own_section:AddLabel("Made by: SANGUINE 🤤🤤")
-my_own_section:AddParagraph("Firefly Timer", "Open the settings GUI to configure Auto Jump and Firefly Timer.")
+-- ===== TOGGLES FIRST: nothing above can fail, so they always appear =====
+local impl = {
+	ready = false,
+	desired = false,        -- Enable Firefly Timer
+	desiredRestore = false, -- Restore Jar On Respawn
+	desiredMove = false,    -- Move Cooldown Window
+}
 
-local ENV
-if getgenv then ENV = getgenv() else ENV = _G end
-
-if ENV.__FireflyConnections then
-	for _, conn in ipairs(ENV.__FireflyConnections) do
-		pcall(function() conn:Disconnect() end)
-	end
-end
-ENV.__FireflyConnections = {}
-
-if ENV.__FireflyJumpThread then
-	pcall(function() task.cancel(ENV.__FireflyJumpThread) end)
-	ENV.__FireflyJumpThread = nil
+local function safeCall(fn, ...)
+	if type(fn) ~= "function" then return end
+	local okA, errA = pcall(fn, ...)
+	if not okA then note("Error: " .. tostring(errA)) end
 end
 
 pcall(function()
-	local CAS = game:GetService("ContextActionService")
-	CAS:UnbindAction("FireflyAutoJump")
+	my_own_section:AddToggle("Enable Firefly Timer", function(bool)
+		impl.desired = bool and true or false
+		if impl.ready then safeCall(impl.apply, impl.desired) end
+	end)
 end)
 
-local MY_ID = tick() .. math.random(1000, 9999)
-ENV.__FireflyInstanceID = MY_ID
+pcall(function()
+	my_own_section:AddToggle("Restore Jar On Respawn", function(bool)
+		impl.desiredRestore = bool and true or false
+		if impl.ready then safeCall(impl.setRestore, impl.desiredRestore) end
+	end)
+end)
 
-local function isCurrent()
-	return ENV.__FireflyInstanceID == MY_ID
-end
+pcall(function()
+	my_own_section:AddToggle("Move Cooldown Window", function(bool)
+		impl.desiredMove = bool and true or false
+		if impl.ready then safeCall(impl.setMove, impl.desiredMove) end
+	end)
+end)
 
-local function regConn(conn)
-	if conn then table.insert(ENV.__FireflyConnections, conn) end
-	return conn
-end
+pcall(function()
+	-- Saves only on a user flip after load (never from the hub restoring state on join)
+	my_own_section:AddToggle("Save Cooldown Position", function(bool)
+		if bool and impl.ready then safeCall(impl.savePos) end
+	end)
+end)
 
-local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
-local ContextActionService = game:GetService("ContextActionService")
-local UserInputService = game:GetService("UserInputService")
-local LocalPlayer = Players.LocalPlayer
-local pg = LocalPlayer:WaitForChild("PlayerGui")
+pcall(function() my_own_section:AddLabel("Made by: SANGUINE 🤤🤤") end)
 
-for _, name in ipairs({"FireflySettingsGui", "FireflyTimerGui", "FireflyCooldownGui"}) do
-	local old = pg:FindFirstChild(name)
-	if old then old:Destroy() end
-end
+-- ===== Everything else, guarded; errors are shown on screen =====
+local function init()
+	local Players = game:GetService("Players")
+	local RunService = game:GetService("RunService")
+	local UserInputService = game:GetService("UserInputService")
+	local HttpService = game:GetService("HttpService")
+	local ReplicatedStorage = game:GetService("ReplicatedStorage")
+	local LocalPlayer = Players.LocalPlayer
+	local pg = LocalPlayer:WaitForChild("PlayerGui")
 
-local countdownDuration = 2.5
-local frameSize = UDim2.new(0, 100, 0, 50)
-local framePosition = UDim2.new(0.5, -50, 0.5, -100)
-local cdFontSize = 22
+	local COUNTDOWN = 2.5             -- copy of the game's own jar cooldown
+	local COOLDOWN = 16               -- cooldown tracker length
+	local FIRST_JUMP_REMAINING = 0.24 -- fire jump 1 when the displayed countdown reaches this
+	local JUMP_GAP = 0.40             -- jump 2 fires this long after jump 1 fired
 
-local enabled = false
-local autoJumpEnabled = false
-local firstJumpTiming = 0.24
-local secondJumpTiming = 0.40
+	local RESTORE_DELAY = 1.5   -- seconds to let the game hand out its own jar before we restore ours
+	local POS_FILE = "FireflyTimer_CDPos.json"
 
-local isCountingDown = false
-local fireflyActive = false
-local countdownConnection = nil
-local toolConnection = nil
-local screenGui, frame, label, stroke, corner
+	local MY_ID = tostring(os.clock()) .. tostring(math.random(1000, 9999))
+	pcall(function() LocalPlayer:SetAttribute("FireflyRunId", MY_ID) end)
+	local function isCurrent()
+		local okA, v = pcall(function() return LocalPlayer:GetAttribute("FireflyRunId") end)
+		if not okA then return true end
+		return v == MY_ID
+	end
 
-local cdScreenGui, cdFrame, cdLabel
-local cooldownConnection = nil
-local blockConnection = nil
-local isOnCooldown = false
+	local enabled = false
+	local moveMode = false
+	local hasCd = false        -- true after the first fire (or a reset): box stays visible showing "Active"
+	local token = 0
+	local cdStart, cdEnd = 0, 0
+	local conns, hooked = {}, {}
+	local scanToken = 0
+	local gui, countLabel, cdLabel
 
-local jumpTriggered = false
-local jumpActionBound = false
-local roundRewardsHooked = false
+	-- ===== Saved cooldown-window position =====
+	local savedPos = nil -- UDim2 (scale), loaded from file
 
-local backpackAddedConn, charAddedConn
-local backpackWatchConn, characterWatchConn
-
-local function buildGui()
-	if screenGui then return end
-	screenGui = Instance.new("ScreenGui")
-	screenGui.Name = "FireflyTimerGui"
-	screenGui.ResetOnSpawn = false
-	screenGui.Parent = pg
-
-	frame = Instance.new("Frame")
-	frame.Name = "TimerFrame"
-	frame.Size = frameSize
-	frame.Position = framePosition
-	frame.BackgroundTransparency = 0.7
-	frame.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
-	frame.BorderSizePixel = 0
-	frame.Visible = false
-	frame.Parent = screenGui
-
-	stroke = Instance.new("UIStroke")
-	stroke.Color = Color3.fromRGB(255, 0, 0)
-	stroke.Thickness = 1
-	stroke.Parent = frame
-
-	label = Instance.new("TextLabel")
-	label.Name = "CountdownLabel"
-	label.Size = UDim2.new(1, 0, 1, 0)
-	label.BackgroundTransparency = 1
-	label.TextColor3 = Color3.fromRGB(0, 0, 0)
-	label.TextScaled = true
-	label.Font = Enum.Font.GothamBold
-	label.Text = tostring(countdownDuration)
-	label.Parent = frame
-
-	corner = Instance.new("UICorner")
-	corner.CornerRadius = UDim.new(0, 6)
-	corner.Parent = frame
-end
-
-local function buildCooldownGui()
-	if cdScreenGui then return end
-	cdScreenGui = Instance.new("ScreenGui")
-	cdScreenGui.Name = "FireflyCooldownGui"
-	cdScreenGui.ResetOnSpawn = false
-	cdScreenGui.Parent = pg
-
-	cdFrame = Instance.new("Frame")
-	cdFrame.Name = "CooldownFrame"
-	cdFrame.Size = UDim2.new(0, 110, 0, 28)
-	cdFrame.Position = UDim2.new(0, 20, 0.5, 0)
-	cdFrame.BackgroundTransparency = 1
-	cdFrame.BorderSizePixel = 0
-	cdFrame.Active = true
-	cdFrame.Visible = false
-	cdFrame.Parent = cdScreenGui
-
-	cdLabel = Instance.new("TextLabel")
-	cdLabel.Name = "CooldownLabel"
-	cdLabel.Size = UDim2.new(1, 0, 1, 0)
-	cdLabel.BackgroundTransparency = 1
-	cdLabel.TextColor3 = Color3.fromRGB(0, 0, 0)
-	cdLabel.TextSize = cdFontSize
-	cdLabel.Font = Enum.Font.GothamBold
-	cdLabel.TextXAlignment = Enum.TextXAlignment.Left
-	cdLabel.Text = "0.0"
-	cdLabel.Parent = cdFrame
-
-	local dragging, dragStart, startPos
-	cdFrame.InputBegan:Connect(function(input)
-		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-			dragging = true
-			dragStart = input.Position
-			startPos = cdFrame.Position
-			input.Changed:Connect(function()
-				if input.UserInputState == Enum.UserInputState.End then
-					dragging = false
+	local function loadPos()
+		pcall(function()
+			if isfile and readfile and isfile(POS_FILE) then
+				local d = HttpService:JSONDecode(readfile(POS_FILE))
+				if type(d) == "table" and type(d.x) == "number" and type(d.y) == "number" then
+					savedPos = UDim2.fromScale(math.clamp(d.x, 0, 0.95), math.clamp(d.y, 0, 0.95))
 				end
+			end
+		end)
+	end
+	loadPos()
+
+	-- remove old guis (PlayerGui only, every step guarded)
+	for _, n in ipairs({ "FireflyLiteGui", "FireflyTimerGui", "FireflyCooldownGui", "FireflySettingsGui" }) do
+		pcall(function()
+			local o = pg:FindFirstChild(n)
+			if o then o:Destroy() end
+		end)
+	end
+
+	local function makeLabel(parent, pos, size, textSize)
+		local l = Instance.new("TextLabel")
+		l.Position = pos
+		l.Size = size
+		l.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+		l.BackgroundTransparency = 0.5
+		l.TextColor3 = Color3.fromRGB(255, 255, 255)
+		l.Font = Enum.Font.GothamBold
+		l.TextSize = textSize
+		l.Text = ""
+		l.Visible = false
+		l.Parent = parent
+		pcall(function() Instance.new("UICorner", l) end)
+		return l
+	end
+
+	local function setupDrag(label)
+		local dragging, dragStart, startPos = false, nil, nil
+		label.InputBegan:Connect(function(input)
+			if not moveMode or not isCurrent() then return end
+			if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+				dragging = true
+				dragStart = input.Position
+				startPos = label.Position
+				input.Changed:Connect(function()
+					if input.UserInputState == Enum.UserInputState.End then dragging = false end
+				end)
+			end
+		end)
+		UserInputService.InputChanged:Connect(function(input)
+			if not dragging or not moveMode or not isCurrent() then return end
+			if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseMovement then
+				local d = input.Position - dragStart
+				label.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+			end
+		end)
+	end
+
+	local function buildGui()
+		if gui and gui.Parent then return end
+		gui = Instance.new("ScreenGui")
+		gui.Name = "FireflyLiteGui"
+		gui.ResetOnSpawn = false
+		gui.IgnoreGuiInset = true
+		gui.DisplayOrder = 999
+		gui.Parent = pg
+		countLabel = makeLabel(gui, UDim2.new(0.5, -50, 0.4, 0), UDim2.fromOffset(100, 50), 32)
+		cdLabel = makeLabel(gui, savedPos or UDim2.new(0, 20, 0.5, 0), UDim2.fromOffset(110, 44), 26)
+		cdLabel.Active = false
+		setupDrag(cdLabel)
+	end
+
+	-- Cooldown box: hidden before the first fire, then always visible
+	-- (counting during the 16s, "Active" the rest of the time).
+	local function hideGui()
+		if countLabel then countLabel.Visible = false end
+		if cdLabel then
+			if moveMode then
+				cdLabel.Visible = true
+				cdLabel.Text = hasCd and "Active" or "CD 0.0"
+			elseif hasCd then
+				cdLabel.Visible = true
+				cdLabel.Text = "Active"
+			else
+				cdLabel.Visible = false
+			end
+		end
+	end
+
+	-- ===== Jump =====
+	local function fireJump()
+		local char = LocalPlayer.Character
+		local hum = char and char:FindFirstChildOfClass("Humanoid")
+		if not hum or hum.Health <= 0 then return end
+		hum.Jump = true
+		hum:ChangeState(Enum.HumanoidStateType.Jumping)
+	end
+
+	-- ===== Timer (the jar tool itself is never touched) =====
+	local function onActivated()
+		if not enabled or not isCurrent() then return end
+		local now = os.clock()
+		if now < cdEnd then return end
+
+		token = token + 1
+		local my = token
+		cdStart, cdEnd = now, now + COOLDOWN
+		hasCd = true
+
+		local okG, errG = pcall(buildGui)
+		if not okG then note("GUI error: " .. tostring(errG)) end
+
+		local timeLeft = COUNTDOWN
+		local j1 = false
+		task.spawn(function()
+			while enabled and isCurrent() and my == token do
+				local dt = RunService.Heartbeat:Wait()
+				timeLeft = timeLeft - dt
+				if timeLeft < 0 then timeLeft = 0 end
+
+				-- jump 1: when the displayed countdown reaches FIRST_JUMP_REMAINING
+				if not j1 and timeLeft <= FIRST_JUMP_REMAINING then
+					j1 = true
+					fireJump()
+					-- jump 2: JUMP_GAP after jump 1 actually fired
+					task.delay(JUMP_GAP, function()
+						if enabled and isCurrent() and my == token then fireJump() end
+					end)
+				end
+
+				local t = os.clock()
+				local k = cdEnd - t
+				if countLabel then
+					countLabel.Visible = timeLeft > 0
+					if timeLeft > 0 then countLabel.Text = string.format("%.1f", timeLeft) end
+				end
+				if cdLabel then
+					if k > 0 then
+						cdLabel.Visible = true
+						cdLabel.Text = string.format("CD %.1f", t - cdStart)
+					end
+				end
+				if timeLeft <= 0 and k <= 0 then break end
+			end
+			if my == token then hideGui() end -- shows "Active" once the 16s is over
+		end)
+	end
+
+	local function scan()
+		local places = { LocalPlayer:FindFirstChildOfClass("Backpack"), LocalPlayer.Character }
+		for i = 1, 2 do
+			local place = places[i]
+			if place then
+				for _, child in ipairs(place:GetChildren()) do
+					if child:IsA("Tool") and child.Name == "Fireflies" and not hooked[child] then
+						hooked[child] = true
+						table.insert(conns, child.Activated:Connect(function() onActivated() end))
+					end
+				end
+			end
+		end
+	end
+
+	-- Respawn / round end: cancel everything and show "Active" (jar usable again)
+	local function resetCooldown()
+		token = token + 1
+		cdEnd = 0
+		hasCd = true
+		hideGui()
+	end
+
+	-- ===== Round-end reset =====
+	local roundHooked = false
+	local function hookRoundRewards()
+		if roundHooked then return end
+		local remote
+		pcall(function() remote = ReplicatedStorage.Remotes.Gameplay.GetLastRoundRewards end)
+		if not remote then return end
+
+		if hookfunction then
+			local okH = pcall(function()
+				local old
+				old = hookfunction(remote.InvokeServer, function(self, ...)
+					if self == remote and enabled and isCurrent() then
+						pcall(resetCooldown)
+					end
+					return old(self, ...)
+				end)
 			end)
+			if okH then roundHooked = true return end
 		end
-	end)
-	cdFrame.InputChanged:Connect(function(input)
-		if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
-			if dragging then
-				local delta = input.Position - dragStart
-				cdFrame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
-			end
-		end
-	end)
-end
 
-local function bindJumpAction()
-	if jumpActionBound then
-		ContextActionService:UnbindAction("FireflyAutoJump")
-		jumpActionBound = false
+		if getrawmetatable and getnamecallmethod and setreadonly and newcclosure then
+			local okH = pcall(function()
+				local mt = getrawmetatable(game)
+				local oldNamecall = mt.__namecall
+				setreadonly(mt, false)
+				mt.__namecall = newcclosure(function(self, ...)
+					if self == remote and getnamecallmethod() == "InvokeServer" and enabled and isCurrent() then
+						pcall(resetCooldown)
+					end
+					return oldNamecall(self, ...)
+				end)
+				setreadonly(mt, true)
+			end)
+			if okH then roundHooked = true end
+		end
 	end
-	ContextActionService:BindAction("FireflyAutoJump", function(actionName, inputState)
-		if inputState == Enum.UserInputState.Begin then
-			local char = LocalPlayer.Character
-			if char then
-				local humanoid = char:FindFirstChildOfClass("Humanoid")
-				if humanoid then
-					humanoid.Jump = true
-				end
+
+	local function start()
+		buildGui()
+		scanToken = scanToken + 1
+		local my = scanToken
+		table.insert(conns, LocalPlayer.CharacterAdded:Connect(function()
+			if enabled and isCurrent() then resetCooldown() end
+		end))
+		task.spawn(function()
+			while enabled and isCurrent() and my == scanToken do
+				pcall(scan)
+				task.wait(0.5)
 			end
-		end
-		return Enum.ContextActionResult.Pass
-	end, false, Enum.KeyCode.Space)
-	jumpActionBound = true
-end
-
-local function unbindJumpAction()
-	if not jumpActionBound then return end
-	ContextActionService:UnbindAction("FireflyAutoJump")
-	jumpActionBound = false
-end
-
-local function fireJump()
-	if not isCurrent() then return false end
-	local char = LocalPlayer.Character
-	if not char then return false end
-	local humanoid = char:FindFirstChildOfClass("Humanoid")
-	if not humanoid then return false end
-	humanoid.Jump = true
-	humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
-	return true
-end
-
-local function fireTwoJumps()
-	fireJump()
-	if ENV.__FireflyJumpThread then
-		pcall(function() task.cancel(ENV.__FireflyJumpThread) end)
-		ENV.__FireflyJumpThread = nil
+		end)
+		task.spawn(function()
+			for _ = 1, 20 do
+				if roundHooked or not enabled or scanToken ~= my then break end
+				pcall(hookRoundRewards)
+				task.wait(0.5)
+			end
+		end)
 	end
-	ENV.__FireflyJumpThread = task.delay(secondJumpTiming, function()
+
+	local function stop()
+		scanToken = scanToken + 1
+		token = token + 1
+		cdEnd = 0
+		hasCd = false
+		hideGui()
+		for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
+		table.clear(conns)
+		table.clear(hooked)
+	end
+
+	impl.apply = function(bool)
 		if not isCurrent() then return end
-		fireJump()
-		ENV.__FireflyJumpThread = nil
-	end)
-end
-
-local function startCountdown()
-	if not enabled then return end
-	buildGui()
-	if countdownConnection then countdownConnection:Disconnect() countdownConnection = nil end
-
-	jumpTriggered = false
-	isCountingDown = true
-	frame.Visible = true
-	frame.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
-	frame.BackgroundTransparency = 0.7
-	stroke.Color = Color3.fromRGB(255, 0, 0)
-	label.TextColor3 = Color3.fromRGB(0, 0, 0)
-	label.Text = string.format("%.1f", countdownDuration)
-
-	local timeLeft = countdownDuration
-	countdownConnection = RunService.Heartbeat:Connect(function(deltaTime)
-		if not isCurrent() then
-			if countdownConnection then countdownConnection:Disconnect() countdownConnection = nil end
-			return
-		end
-		timeLeft -= deltaTime
-		if timeLeft <= 0 then
-			timeLeft = 0
-			label.Text = "0.0"
-			frame.Visible = false
-			isCountingDown = false
-			fireflyActive = false
-			if countdownConnection then countdownConnection:Disconnect() countdownConnection = nil end
-			return
-		end
-		if autoJumpEnabled and isCountingDown and not jumpTriggered and timeLeft <= firstJumpTiming then
-			jumpTriggered = true
-			fireTwoJumps()
-		end
-		label.Text = string.format("%.1f", timeLeft)
-	end)
-	regConn(countdownConnection)
-end
-
-local function startCooldownPanel()
-	buildCooldownGui()
-	if cooldownConnection then cooldownConnection:Disconnect() cooldownConnection = nil end
-	cdFrame.Visible = true
-	cdLabel.Text = "0.0"
-	local elapsed = 0
-	cooldownConnection = RunService.Heartbeat:Connect(function(deltaTime)
-		if not isCurrent() then
-			if cooldownConnection then cooldownConnection:Disconnect() cooldownConnection = nil end
-			return
-		end
-		elapsed += deltaTime
-		if elapsed >= 16 then
-			elapsed = 16
-			cdLabel.Text = "Active"
-			if cooldownConnection then cooldownConnection:Disconnect() cooldownConnection = nil end
-			return
-		end
-		cdLabel.Text = string.format("%.1f", elapsed)
-	end)
-	regConn(cooldownConnection)
-end
-
-local function startBlockTimer()
-	isOnCooldown = true
-	if blockConnection then blockConnection:Disconnect() blockConnection = nil end
-	local elapsed = 0
-	blockConnection = RunService.Heartbeat:Connect(function(deltaTime)
-		if not isCurrent() then
-			if blockConnection then blockConnection:Disconnect() blockConnection = nil end
-			return
-		end
-		elapsed += deltaTime
-		if elapsed >= 16 then
-			isOnCooldown = false
-			if blockConnection then blockConnection:Disconnect() blockConnection = nil end
-		end
-	end)
-	regConn(blockConnection)
-end
-
-local function connectToTool(tool)
-	if toolConnection then toolConnection:Disconnect() toolConnection = nil end
-	toolConnection = tool.Activated:Connect(function()
-		if not isCurrent() then return end
-		if not enabled then return end
-		if isOnCooldown then return end
-		fireflyActive = true
-		startCountdown()
-		startCooldownPanel()
-		startBlockTimer()
-	end)
-	regConn(toolConnection)
-end
-
-local function resetCooldown()
-	if cooldownConnection then cooldownConnection:Disconnect() cooldownConnection = nil end
-	if blockConnection then blockConnection:Disconnect() blockConnection = nil end
-	isOnCooldown = false
-	if cdLabel then cdLabel.Text = "Active" end
-	if cdFrame then cdFrame.Visible = true end
-end
-
-local function hookRoundRewards()
-	if roundRewardsHooked then return end
-	local rp = game:GetService("ReplicatedStorage")
-	local remotes = rp:FindFirstChild("Remotes")
-	local gameplay = remotes and remotes:FindFirstChild("Gameplay")
-	local remote = gameplay and gameplay:FindFirstChild("GetLastRoundRewards")
-	if not remote then return end
-
-	if hookfunction then
-		local ok = pcall(function()
-			local old
-			old = hookfunction(remote.InvokeServer, function(self, ...)
-				pcall(resetCooldown)
-				return old(self, ...)
-			end)
-		end)
-		if ok then
-			roundRewardsHooked = true
-			return
-		end
-	end
-
-	if hookmetamethod and getrawmetatable and getnamecallmethod and setreadonly and newcclosure then
-		local ok = pcall(function()
-			local mt = getrawmetatable(game)
-			local oldNamecall = mt.__namecall
-			setreadonly(mt, false)
-			mt.__namecall = newcclosure(function(self, ...)
-				if self == remote and getnamecallmethod() == "InvokeServer" then
-					pcall(resetCooldown)
-				end
-				return oldNamecall(self, ...)
-			end)
-			setreadonly(mt, true)
-		end)
-		if ok then
-			roundRewardsHooked = true
-		end
-	end
-end
-
-local function unhookTool()
-	if toolConnection then toolConnection:Disconnect() toolConnection = nil end
-	if countdownConnection then countdownConnection:Disconnect() countdownConnection = nil end
-	if cooldownConnection then cooldownConnection:Disconnect() cooldownConnection = nil end
-	if blockConnection then blockConnection:Disconnect() blockConnection = nil end
-	if backpackAddedConn then backpackAddedConn:Disconnect() backpackAddedConn = nil end
-	if charAddedConn then charAddedConn:Disconnect() charAddedConn = nil end
-	if backpackWatchConn then backpackWatchConn:Disconnect() backpackWatchConn = nil end
-	if characterWatchConn then characterWatchConn:Disconnect() characterWatchConn = nil end
-	if ENV.__FireflyJumpThread then
-		pcall(function() task.cancel(ENV.__FireflyJumpThread) end)
-		ENV.__FireflyJumpThread = nil
-	end
-	unbindJumpAction()
-	roundRewardsHooked = false
-	if frame then frame.Visible = false end
-	if cdFrame then cdFrame.Visible = false end
-	isCountingDown = false
-	isOnCooldown = false
-	fireflyActive = false
-end
-
-local function hookTool()
-	unhookTool()
-	local function watchContainer(container)
-		if not container then return nil end
-		local tool = container:FindFirstChild("Fireflies")
-		if tool then connectToTool(tool) end
-		return container.ChildAdded:Connect(function(child)
-			if child.Name == "Fireflies" then connectToTool(child) end
-		end)
-	end
-	backpackWatchConn = watchContainer(LocalPlayer:FindFirstChildOfClass("Backpack"))
-	characterWatchConn = watchContainer(LocalPlayer.Character)
-	backpackAddedConn = LocalPlayer.ChildAdded:Connect(function(child)
-		if child:IsA("Backpack") then
-			if backpackWatchConn then backpackWatchConn:Disconnect() end
-			backpackWatchConn = watchContainer(child)
-		end
-	end)
-	charAddedConn = LocalPlayer.CharacterAdded:Connect(function(char)
-		resetCooldown()
-		if characterWatchConn then characterWatchConn:Disconnect() end
-		characterWatchConn = watchContainer(char)
-	end)
-	bindJumpAction()
-	hookRoundRewards()
-	task.spawn(function()
-		for _ = 1, 20 do
-			if roundRewardsHooked then break end
-			hookRoundRewards()
-			task.wait(0.5)
-		end
-	end)
-end
-
-local settingsGui, settingsOuter, settingsBody
-local isMinimized = false
-local enableBtn = nil
-
-local function createSlider(parent, yPos, labelText, minVal, maxVal, defaultVal, onChange)
-	local container = Instance.new("Frame")
-	container.Size = UDim2.new(1, -28, 0, 52)
-	container.Position = UDim2.new(0, 14, 0, yPos)
-	container.BackgroundTransparency = 1
-	container.Parent = parent
-
-	local title = Instance.new("TextLabel")
-	title.Size = UDim2.new(1, 0, 0, 18)
-	title.BackgroundTransparency = 1
-	title.Text = labelText .. ": " .. string.format("%.2f", defaultVal)
-	title.TextColor3 = Color3.fromRGB(235, 235, 235)
-	title.TextSize = 15
-	title.Font = Enum.Font.Gotham
-	title.TextXAlignment = Enum.TextXAlignment.Left
-	title.Parent = container
-
-	local bar = Instance.new("Frame")
-	bar.Size = UDim2.new(1, 0, 0, 14)
-	bar.Position = UDim2.new(0, 0, 0, 26)
-	bar.BackgroundColor3 = Color3.fromRGB(70, 70, 74)
-	bar.BorderSizePixel = 0
-	bar.Parent = container
-	local bc = Instance.new("UICorner")
-	bc.CornerRadius = UDim.new(0, 7)
-	bc.Parent = bar
-
-	local fill = Instance.new("Frame")
-	fill.Size = UDim2.new((defaultVal - minVal) / (maxVal - minVal), 0, 1, 0)
-	fill.BackgroundColor3 = Color3.fromRGB(220, 70, 70)
-	fill.BorderSizePixel = 0
-	fill.Parent = bar
-	local fc = Instance.new("UICorner")
-	fc.CornerRadius = UDim.new(0, 7)
-	fc.Parent = fill
-
-	local dragging = false
-	local function updateFromX(xPos)
-		local rel = (xPos - bar.AbsolutePosition.X) / bar.AbsoluteSize.X
-		rel = math.clamp(rel, 0, 1)
-		local val = minVal + rel * (maxVal - minVal)
-		val = math.floor(val * 100 + 0.5) / 100
-		fill.Size = UDim2.new(rel, 0, 1, 0)
-		title.Text = labelText .. ": " .. string.format("%.2f", val)
-		onChange(val)
-	end
-
-	bar.InputBegan:Connect(function(input)
-		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-			dragging = true
-			updateFromX(input.Position.X)
-		end
-	end)
-	UserInputService.InputChanged:Connect(function(input)
-		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
-			updateFromX(input.Position.X)
-		end
-	end)
-	UserInputService.InputEnded:Connect(function(input)
-		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-			dragging = false
-		end
-	end)
-	return title
-end
-
-local function buildSettingsGui()
-	if settingsGui then return settingsGui end
-
-	settingsGui = Instance.new("ScreenGui")
-	settingsGui.Name = "FireflySettingsGui"
-	settingsGui.ResetOnSpawn = false
-	settingsGui.Parent = pg
-
-	settingsOuter = Instance.new("Frame")
-	settingsOuter.Name = "Outer"
-	settingsOuter.Size = UDim2.new(0, 320, 0, 220)
-	settingsOuter.Position = UDim2.new(0.5, -160, 0.3, 0)
-	settingsOuter.BackgroundColor3 = Color3.fromRGB(30, 30, 34)
-	settingsOuter.BorderSizePixel = 0
-	settingsOuter.Active = true
-	settingsOuter.Visible = false
-	settingsOuter.Parent = settingsGui
-	local oc = Instance.new("UICorner")
-	oc.CornerRadius = UDim.new(0, 10)
-	oc.Parent = settingsOuter
-
-	local titleBar = Instance.new("Frame")
-	titleBar.Name = "TitleBar"
-	titleBar.Size = UDim2.new(1, 0, 0, 34)
-	titleBar.BackgroundColor3 = Color3.fromRGB(48, 48, 54)
-	titleBar.BorderSizePixel = 0
-	titleBar.Active = true
-	titleBar.Parent = settingsOuter
-	local tc = Instance.new("UICorner")
-	tc.CornerRadius = UDim.new(0, 10)
-	tc.Parent = titleBar
-
-	local titleLabel = Instance.new("TextLabel")
-	titleLabel.Size = UDim2.new(1, -50, 1, 0)
-	titleLabel.Position = UDim2.new(0, 14, 0, 0)
-	titleLabel.BackgroundTransparency = 1
-	titleLabel.Text = "Firefly Timer Settings"
-	titleLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
-	titleLabel.TextSize = 16
-	titleLabel.Font = Enum.Font.GothamBold
-	titleLabel.TextXAlignment = Enum.TextXAlignment.Left
-	titleLabel.Parent = titleBar
-
-	local minimizeBtn = Instance.new("TextButton")
-	minimizeBtn.Size = UDim2.new(0, 24, 0, 24)
-	minimizeBtn.Position = UDim2.new(1, -30, 0, 5)
-	minimizeBtn.BackgroundColor3 = Color3.fromRGB(200, 60, 60)
-	minimizeBtn.Text = "—"
-	minimizeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-	minimizeBtn.TextSize = 16
-	minimizeBtn.Font = Enum.Font.GothamBold
-	minimizeBtn.BorderSizePixel = 0
-	minimizeBtn.AutoButtonColor = false
-	minimizeBtn.Parent = titleBar
-	local mc = Instance.new("UICorner")
-	mc.CornerRadius = UDim.new(0, 6)
-	mc.Parent = minimizeBtn
-
-	local dragging, dragStart, startPos
-	titleBar.InputBegan:Connect(function(input)
-		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-			dragging = true
-			dragStart = input.Position
-			startPos = settingsOuter.Position
-			input.Changed:Connect(function()
-				if input.UserInputState == Enum.UserInputState.End then dragging = false end
-			end)
-		end
-	end)
-	titleBar.InputChanged:Connect(function(input)
-		if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
-			if dragging then
-				local delta = input.Position - dragStart
-				settingsOuter.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
-			end
-		end
-	end)
-
-	minimizeBtn.MouseButton1Click:Connect(function()
-		isMinimized = not isMinimized
-		if isMinimized then
-			settingsBody.Visible = false
-			settingsOuter.Size = UDim2.new(0, 320, 0, 34)
-			minimizeBtn.Text = "+"
-		else
-			settingsBody.Visible = true
-			settingsOuter.Size = UDim2.new(0, 320, 0, 220)
-			minimizeBtn.Text = "—"
-		end
-	end)
-
-	settingsBody = Instance.new("Frame")
-	settingsBody.Name = "Body"
-	settingsBody.Size = UDim2.new(1, 0, 1, -34)
-	settingsBody.Position = UDim2.new(0, 0, 0, 34)
-	settingsBody.BackgroundTransparency = 1
-	settingsBody.Parent = settingsOuter
-
-	enableBtn = Instance.new("TextButton")
-	enableBtn.Size = UDim2.new(1, -28, 0, 40)
-	enableBtn.Position = UDim2.new(0, 14, 0, 12)
-	enableBtn.BackgroundColor3 = Color3.fromRGB(70, 70, 74)
-	enableBtn.Text = "Firefly Timer: OFF"
-	enableBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-	enableBtn.TextSize = 16
-	enableBtn.Font = Enum.Font.GothamBold
-	enableBtn.BorderSizePixel = 0
-	enableBtn.AutoButtonColor = false
-	enableBtn.Parent = settingsBody
-	local ebc = Instance.new("UICorner")
-	ebc.CornerRadius = UDim.new(0, 8)
-	ebc.Parent = enableBtn
-
-	enableBtn.MouseButton1Click:Connect(function()
-		enabled = not enabled
+		enabled = bool
 		if enabled then
-			enableBtn.Text = "Firefly Timer: ON"
-			enableBtn.BackgroundColor3 = Color3.fromRGB(70, 180, 70)
-			buildGui()
-			buildCooldownGui()
-			hookTool()
+			local okS, errS = pcall(start)
+			if okS then note("Firefly Timer enabled")
+			else note("Start error: " .. tostring(errS)) end
 		else
-			enableBtn.Text = "Firefly Timer: OFF"
-			enableBtn.BackgroundColor3 = Color3.fromRGB(70, 70, 74)
-			unhookTool()
+			pcall(stop)
+			note("Firefly Timer disabled")
 		end
-	end)
+	end
 
-	local toggleBtn = Instance.new("TextButton")
-	toggleBtn.Size = UDim2.new(1, -28, 0, 40)
-	toggleBtn.Position = UDim2.new(0, 14, 0, 62)
-	toggleBtn.BackgroundColor3 = Color3.fromRGB(70, 70, 74)
-	toggleBtn.Text = "Auto Jump: OFF"
-	toggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-	toggleBtn.TextSize = 16
-	toggleBtn.Font = Enum.Font.GothamBold
-	toggleBtn.BorderSizePixel = 0
-	toggleBtn.AutoButtonColor = false
-	toggleBtn.Parent = settingsBody
-	local tgc = Instance.new("UICorner")
-	tgc.CornerRadius = UDim.new(0, 8)
-	tgc.Parent = toggleBtn
+	-- ===== Movable cooldown window =====
+	impl.setMove = function(bool)
+		if not isCurrent() then return end
+		moveMode = bool
+		buildGui()
+		cdLabel.Active = bool
+		if os.clock() >= cdEnd then hideGui() end
+	end
 
-	toggleBtn.MouseButton1Click:Connect(function()
-		autoJumpEnabled = not autoJumpEnabled
-		if autoJumpEnabled then
-			toggleBtn.Text = "Auto Jump: ON"
-			toggleBtn.BackgroundColor3 = Color3.fromRGB(70, 180, 70)
+	impl.savePos = function()
+		if not isCurrent() then return end
+		buildGui()
+		local size = gui.AbsoluteSize
+		if size.X <= 0 or size.Y <= 0 then return end
+		-- Position is already relative to the ScreenGui's own area, so convert it directly
+		local lp = cdLabel.Position
+		local x = math.clamp(lp.X.Scale + lp.X.Offset / size.X, 0, 0.95)
+		local y = math.clamp(lp.Y.Scale + lp.Y.Offset / size.Y, 0, 0.95)
+		savedPos = UDim2.fromScale(x, y) -- stored only; the label stays exactly where it is
+		local wrote = false
+		pcall(function()
+			if writefile then
+				writefile(POS_FILE, HttpService:JSONEncode({ x = x, y = y }))
+				wrote = true
+			end
+		end)
+		if wrote then
+			note("Cooldown position saved")
 		else
-			toggleBtn.Text = "Auto Jump: OFF"
-			toggleBtn.BackgroundColor3 = Color3.fromRGB(70, 70, 74)
+			note("Position kept for this session (executor can't save files)")
 		end
-	end)
+	end
 
-	createSlider(settingsBody, 112, "Cooldown Font Size", 8, 48, cdFontSize, function(v)
-		cdFontSize = math.floor(v + 0.5)
-		if cdLabel then cdLabel.TextSize = cdFontSize end
-	end)
+	-- ===== Restore jar on respawn (client-side only) =====
+	local restoreOn = false
+	local restoreToken = 0
+	local jarCache, cachedFrom = nil, nil
+	local restoreConn = nil
 
-	return settingsGui
+	local function eachJar(fn)
+		local places = { LocalPlayer:FindFirstChildOfClass("Backpack"), LocalPlayer.Character }
+		for i = 1, 2 do
+			local place = places[i]
+			if place then
+				for _, child in ipairs(place:GetChildren()) do
+					if child:IsA("Tool") and child.Name == "Fireflies" then fn(child) end
+				end
+			end
+		end
+	end
+
+	local function restoreJar()
+		if not restoreOn or not isCurrent() then return end
+		local hasJar = false
+		eachJar(function() hasJar = true end)
+		if hasJar or not jarCache then return end -- game already gave one, or nothing cached
+		local bp = LocalPlayer:FindFirstChildOfClass("Backpack") or LocalPlayer:WaitForChild("Backpack", 5)
+		if not bp then return end
+		local okC, c = pcall(function() return jarCache:Clone() end)
+		if okC and c then
+			pcall(function() c:SetAttribute("FireflyRestored", true) end)
+			c.Parent = bp
+		end
+	end
+
+	impl.setRestore = function(bool)
+		if not isCurrent() then return end
+		restoreOn = bool
+		restoreToken = restoreToken + 1
+		local my = restoreToken
+		if restoreConn then restoreConn:Disconnect() restoreConn = nil end
+		if not bool then return end
+
+		restoreConn = LocalPlayer.CharacterAdded:Connect(function()
+			task.spawn(function()
+				task.wait(RESTORE_DELAY)
+				if restoreToken == my then pcall(restoreJar) end
+			end)
+		end)
+
+		-- keep a spare copy of the real jar while it exists
+		task.spawn(function()
+			while restoreOn and isCurrent() and restoreToken == my do
+				local real, restored = nil, {}
+				eachJar(function(t)
+					if t:GetAttribute("FireflyRestored") then table.insert(restored, t)
+					else real = real or t end
+				end)
+				if real then
+					if real ~= cachedFrom then
+						local okC, c = pcall(function() return real:Clone() end)
+						if okC and c then
+							jarCache, cachedFrom = c, real
+						end
+					end
+					for _, r in ipairs(restored) do pcall(function() r:Destroy() end) end -- game gave a real one
+				end
+				task.wait(0.5)
+			end
+		end)
+	end
 end
 
-local ok3, err3 = pcall(function()
-	my_own_section:AddToggle("Open Firefly Settings", function(bool)
-		buildSettingsGui()
-		settingsGui.Enabled = true
-		settingsOuter.Visible = bool
-	end)
-end)
-
-if not ok3 then
-	warn("[Firefly Timer] AddToggle failed: " .. tostring(err3))
-	return
+local okInit, errInit = xpcall(init, function(e) return tostring(e) end)
+if not okInit then
+	note("Init error: " .. tostring(errInit))
+	warn("[Firefly Timer] init failed: " .. tostring(errInit))
+else
+	impl.ready = true
+	if impl.desired then safeCall(impl.apply, true) end
+	if impl.desiredRestore then safeCall(impl.setRestore, true) end
+	if impl.desiredMove then safeCall(impl.setMove, true) end
 end
-
-print("[Firefly Timer] Loaded successfully")
