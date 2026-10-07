@@ -23,7 +23,6 @@ end
 local impl = {
 	ready = false,
 	desired = false,        -- Enable Firefly Timer
-	desiredRestore = false, -- Restore Jar On Respawn
 	desiredMove = false,    -- Move Cooldown Window
 }
 
@@ -37,13 +36,6 @@ pcall(function()
 	my_own_section:AddToggle("Enable Firefly Timer", function(bool)
 		impl.desired = bool and true or false
 		if impl.ready then safeCall(impl.apply, impl.desired) end
-	end)
-end)
-
-pcall(function()
-	my_own_section:AddToggle("Restore Jar On Respawn", function(bool)
-		impl.desiredRestore = bool and true or false
-		if impl.ready then safeCall(impl.setRestore, impl.desiredRestore) end
 	end)
 end)
 
@@ -69,7 +61,6 @@ local function init()
 	local RunService = game:GetService("RunService")
 	local UserInputService = game:GetService("UserInputService")
 	local HttpService = game:GetService("HttpService")
-	local ReplicatedStorage = game:GetService("ReplicatedStorage")
 	local LocalPlayer = Players.LocalPlayer
 	local pg = LocalPlayer:WaitForChild("PlayerGui")
 
@@ -78,7 +69,6 @@ local function init()
 	local FIRST_JUMP_REMAINING = 0.24 -- fire jump 1 when the displayed countdown reaches this
 	local JUMP_GAP = 0.40             -- jump 2 fires this long after jump 1 fired
 
-	local RESTORE_DELAY = 1.5   -- seconds to let the game hand out its own jar before we restore ours
 	local POS_FILE = "FireflyTimer_CDPos.json"
 
 	local MY_ID = tostring(os.clock()) .. tostring(math.random(1000, 9999))
@@ -190,7 +180,7 @@ local function init()
 		end
 	end
 
-	-- ===== Jump =====
+	-- ===== Jump (original version) =====
 	local function fireJump()
 		local char = LocalPlayer.Character
 		local hum = char and char:FindFirstChildOfClass("Humanoid")
@@ -264,50 +254,12 @@ local function init()
 		end
 	end
 
-	-- Respawn / round end: cancel everything and show "Active" (jar usable again)
+	-- Respawn: cancel everything and show "Active" (jar usable again)
 	local function resetCooldown()
 		token = token + 1
 		cdEnd = 0
 		hasCd = true
 		hideGui()
-	end
-
-	-- ===== Round-end reset =====
-	local roundHooked = false
-	local function hookRoundRewards()
-		if roundHooked then return end
-		local remote
-		pcall(function() remote = ReplicatedStorage.Remotes.Gameplay.GetLastRoundRewards end)
-		if not remote then return end
-
-		if hookfunction then
-			local okH = pcall(function()
-				local old
-				old = hookfunction(remote.InvokeServer, function(self, ...)
-					if self == remote and enabled and isCurrent() then
-						pcall(resetCooldown)
-					end
-					return old(self, ...)
-				end)
-			end)
-			if okH then roundHooked = true return end
-		end
-
-		if getrawmetatable and getnamecallmethod and setreadonly and newcclosure then
-			local okH = pcall(function()
-				local mt = getrawmetatable(game)
-				local oldNamecall = mt.__namecall
-				setreadonly(mt, false)
-				mt.__namecall = newcclosure(function(self, ...)
-					if self == remote and getnamecallmethod() == "InvokeServer" and enabled and isCurrent() then
-						pcall(resetCooldown)
-					end
-					return oldNamecall(self, ...)
-				end)
-				setreadonly(mt, true)
-			end)
-			if okH then roundHooked = true end
-		end
 	end
 
 	local function start()
@@ -320,13 +272,6 @@ local function init()
 		task.spawn(function()
 			while enabled and isCurrent() and my == scanToken do
 				pcall(scan)
-				task.wait(0.5)
-			end
-		end)
-		task.spawn(function()
-			for _ = 1, 20 do
-				if roundHooked or not enabled or scanToken ~= my then break end
-				pcall(hookRoundRewards)
 				task.wait(0.5)
 			end
 		end)
@@ -388,75 +333,6 @@ local function init()
 			note("Position kept for this session (executor can't save files)")
 		end
 	end
-
-	-- ===== Restore jar on respawn (client-side only) =====
-	local restoreOn = false
-	local restoreToken = 0
-	local jarCache, cachedFrom = nil, nil
-	local restoreConn = nil
-
-	local function eachJar(fn)
-		local places = { LocalPlayer:FindFirstChildOfClass("Backpack"), LocalPlayer.Character }
-		for i = 1, 2 do
-			local place = places[i]
-			if place then
-				for _, child in ipairs(place:GetChildren()) do
-					if child:IsA("Tool") and child.Name == "Fireflies" then fn(child) end
-				end
-			end
-		end
-	end
-
-	local function restoreJar()
-		if not restoreOn or not isCurrent() then return end
-		local hasJar = false
-		eachJar(function() hasJar = true end)
-		if hasJar or not jarCache then return end -- game already gave one, or nothing cached
-		local bp = LocalPlayer:FindFirstChildOfClass("Backpack") or LocalPlayer:WaitForChild("Backpack", 5)
-		if not bp then return end
-		local okC, c = pcall(function() return jarCache:Clone() end)
-		if okC and c then
-			pcall(function() c:SetAttribute("FireflyRestored", true) end)
-			c.Parent = bp
-		end
-	end
-
-	impl.setRestore = function(bool)
-		if not isCurrent() then return end
-		restoreOn = bool
-		restoreToken = restoreToken + 1
-		local my = restoreToken
-		if restoreConn then restoreConn:Disconnect() restoreConn = nil end
-		if not bool then return end
-
-		restoreConn = LocalPlayer.CharacterAdded:Connect(function()
-			task.spawn(function()
-				task.wait(RESTORE_DELAY)
-				if restoreToken == my then pcall(restoreJar) end
-			end)
-		end)
-
-		-- keep a spare copy of the real jar while it exists
-		task.spawn(function()
-			while restoreOn and isCurrent() and restoreToken == my do
-				local real, restored = nil, {}
-				eachJar(function(t)
-					if t:GetAttribute("FireflyRestored") then table.insert(restored, t)
-					else real = real or t end
-				end)
-				if real then
-					if real ~= cachedFrom then
-						local okC, c = pcall(function() return real:Clone() end)
-						if okC and c then
-							jarCache, cachedFrom = c, real
-						end
-					end
-					for _, r in ipairs(restored) do pcall(function() r:Destroy() end) end -- game gave a real one
-				end
-				task.wait(0.5)
-			end
-		end)
-	end
 end
 
 local okInit, errInit = xpcall(init, function(e) return tostring(e) end)
@@ -466,6 +342,5 @@ if not okInit then
 else
 	impl.ready = true
 	if impl.desired then safeCall(impl.apply, true) end
-	if impl.desiredRestore then safeCall(impl.setRestore, true) end
 	if impl.desiredMove then safeCall(impl.setMove, true) end
 end
